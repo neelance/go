@@ -95,7 +95,7 @@ func trampoline(ctxt *Link, s *sym.Symbol) {
 		if Symaddr(r.Sym) == 0 && r.Sym.Type != sym.SDYNIMPORT {
 			if r.Sym.File != s.File {
 				if !isRuntimeDepPkg(s.File) || !isRuntimeDepPkg(r.Sym.File) {
-					Errorf(s, "unresolved inter-package jump to %s(%s)", r.Sym, r.Sym.File)
+					ctxt.ErrorUnresolved(s, r)
 				}
 				// runtime and its dependent packages may call to each other.
 				// they are fine, as they will be laid down together.
@@ -128,7 +128,7 @@ func relocsym(ctxt *Link, s *sym.Symbol) {
 			continue
 		}
 
-		if r.Sym != nil && ((r.Sym.Type == 0 && !r.Sym.Attr.VisibilityHidden()) || r.Sym.Type == sym.SXREF) {
+		if r.Sym != nil && ((r.Sym.Type == sym.Sxxx && !r.Sym.Attr.VisibilityHidden()) || r.Sym.Type == sym.SXREF) {
 			// When putting the runtime but not main into a shared library
 			// these symbols are undefined and that's OK.
 			if ctxt.BuildMode == BuildModeShared {
@@ -140,7 +140,7 @@ func relocsym(ctxt *Link, s *sym.Symbol) {
 					continue
 				}
 			} else {
-				Errorf(s, "relocation target %s not defined", r.Sym.Name)
+				ctxt.ErrorUnresolved(s, r)
 				continue
 			}
 		}
@@ -1352,15 +1352,16 @@ func (ctxt *Link) dodata() {
 	/*
 	 * We finished data, begin read-only data.
 	 * Not all systems support a separate read-only non-executable data section.
-	 * ELF systems do.
+	 * ELF and Windows PE systems do.
 	 * OS X and Plan 9 do not.
-	 * Windows PE may, but if so we have not implemented it.
 	 * And if we're using external linking mode, the point is moot,
 	 * since it's not our decision; that code expects the sections in
 	 * segtext.
 	 */
 	var segro *sym.Segment
 	if ctxt.IsELF && ctxt.LinkMode == LinkInternal {
+		segro = &Segrodata
+	} else if ctxt.HeadType == objabi.Hwindows {
 		segro = &Segrodata
 	} else {
 		segro = &Segtext
@@ -1902,12 +1903,15 @@ func assignAddress(ctxt *Link, sect *sym.Section, n int, s *sym.Symbol, va uint6
 	return sect, n, va
 }
 
-// assign addresses
-func (ctxt *Link) address() {
+// address assigns virtual addresses to all segments and sections and
+// returns all segments in file order.
+func (ctxt *Link) address() []*sym.Segment {
+	var order []*sym.Segment // Layout order
+
 	va := uint64(*FlagTextAddr)
+	order = append(order, &Segtext)
 	Segtext.Rwx = 05
 	Segtext.Vaddr = va
-	Segtext.Fileoff = uint64(HEADR)
 	for _, s := range Segtext.Sections {
 		va = uint64(Rnd(int64(va), int64(s.Align)))
 		s.Vaddr = va
@@ -1915,7 +1919,6 @@ func (ctxt *Link) address() {
 	}
 
 	Segtext.Length = va - uint64(*FlagTextAddr)
-	Segtext.Filelen = Segtext.Length
 	if ctxt.HeadType == objabi.Hnacl {
 		va += 32 // room for the "halt sled"
 	}
@@ -1936,10 +1939,9 @@ func (ctxt *Link) address() {
 		// writable even for this short period.
 		va = uint64(Rnd(int64(va), int64(*FlagRound)))
 
+		order = append(order, &Segrodata)
 		Segrodata.Rwx = 04
 		Segrodata.Vaddr = va
-		Segrodata.Fileoff = va - Segtext.Vaddr + Segtext.Fileoff
-		Segrodata.Filelen = 0
 		for _, s := range Segrodata.Sections {
 			va = uint64(Rnd(int64(va), int64(s.Align)))
 			s.Vaddr = va
@@ -1947,17 +1949,15 @@ func (ctxt *Link) address() {
 		}
 
 		Segrodata.Length = va - Segrodata.Vaddr
-		Segrodata.Filelen = Segrodata.Length
 	}
 	if len(Segrelrodata.Sections) > 0 {
 		// align to page boundary so as not to mix
 		// rodata, rel-ro data, and executable text.
 		va = uint64(Rnd(int64(va), int64(*FlagRound)))
 
+		order = append(order, &Segrelrodata)
 		Segrelrodata.Rwx = 06
 		Segrelrodata.Vaddr = va
-		Segrelrodata.Fileoff = va - Segrodata.Vaddr + Segrodata.Fileoff
-		Segrelrodata.Filelen = 0
 		for _, s := range Segrelrodata.Sections {
 			va = uint64(Rnd(int64(va), int64(s.Align)))
 			s.Vaddr = va
@@ -1965,20 +1965,12 @@ func (ctxt *Link) address() {
 		}
 
 		Segrelrodata.Length = va - Segrelrodata.Vaddr
-		Segrelrodata.Filelen = Segrelrodata.Length
 	}
 
 	va = uint64(Rnd(int64(va), int64(*FlagRound)))
+	order = append(order, &Segdata)
 	Segdata.Rwx = 06
 	Segdata.Vaddr = va
-	Segdata.Fileoff = va - Segtext.Vaddr + Segtext.Fileoff
-	Segdata.Filelen = 0
-	if ctxt.HeadType == objabi.Hwindows {
-		Segdata.Fileoff = Segtext.Fileoff + uint64(Rnd(int64(Segtext.Length), PEFILEALIGN))
-	}
-	if ctxt.HeadType == objabi.Hplan9 {
-		Segdata.Fileoff = Segtext.Fileoff + Segtext.Filelen
-	}
 	var data *sym.Section
 	var noptr *sym.Section
 	var bss *sym.Section
@@ -2008,16 +2000,14 @@ func (ctxt *Link) address() {
 		}
 	}
 
+	// Assign Segdata's Filelen omitting the BSS. We do this here
+	// simply because right now we know where the BSS starts.
 	Segdata.Filelen = bss.Vaddr - Segdata.Vaddr
 
 	va = uint64(Rnd(int64(va), int64(*FlagRound)))
+	order = append(order, &Segdwarf)
 	Segdwarf.Rwx = 06
 	Segdwarf.Vaddr = va
-	Segdwarf.Fileoff = Segdata.Fileoff + uint64(Rnd(int64(Segdata.Filelen), int64(*FlagRound)))
-	Segdwarf.Filelen = 0
-	if ctxt.HeadType == objabi.Hwindows {
-		Segdwarf.Fileoff = Segdata.Fileoff + uint64(Rnd(int64(Segdata.Filelen), PEFILEALIGN))
-	}
 	for i, s := range Segdwarf.Sections {
 		vlen := int64(s.Length)
 		if i+1 < len(Segdwarf.Sections) {
@@ -2030,8 +2020,6 @@ func (ctxt *Link) address() {
 		}
 		Segdwarf.Length = va - Segdwarf.Vaddr
 	}
-
-	Segdwarf.Filelen = va - Segdwarf.Vaddr
 
 	var (
 		text     = Segtext.Sections[0]
@@ -2119,6 +2107,34 @@ func (ctxt *Link) address() {
 	ctxt.xdefine("runtime.noptrbss", sym.SNOPTRBSS, int64(noptrbss.Vaddr))
 	ctxt.xdefine("runtime.enoptrbss", sym.SNOPTRBSS, int64(noptrbss.Vaddr+noptrbss.Length))
 	ctxt.xdefine("runtime.end", sym.SBSS, int64(Segdata.Vaddr+Segdata.Length))
+
+	return order
+}
+
+// layout assigns file offsets and lengths to the segments in order.
+func (ctxt *Link) layout(order []*sym.Segment) {
+	var prev *sym.Segment
+	for _, seg := range order {
+		if prev == nil {
+			seg.Fileoff = uint64(HEADR)
+		} else {
+			switch ctxt.HeadType {
+			default:
+				seg.Fileoff = prev.Fileoff + uint64(Rnd(int64(prev.Filelen), int64(*FlagRound)))
+			case objabi.Hwindows:
+				seg.Fileoff = prev.Fileoff + uint64(Rnd(int64(prev.Filelen), PEFILEALIGN))
+			case objabi.Hplan9:
+				seg.Fileoff = prev.Fileoff + prev.Filelen
+			}
+		}
+		if seg != &Segdata {
+			// Link.address already set Segdata.Filelen to
+			// account for BSS.
+			seg.Filelen = seg.Length
+		}
+		prev = seg
+	}
+
 }
 
 // add a trampoline with symbol s (to be laid down after the current function)

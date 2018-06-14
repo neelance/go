@@ -99,6 +99,7 @@ func init() {
 var testGOROOT string
 
 var testCC string
+var testGOCACHE string
 
 // The TestMain function creates a go command for testing purposes and
 // deletes it after the tests have been run.
@@ -175,6 +176,13 @@ func TestMain(m *testing.M) {
 			}
 		}
 
+		out, err = exec.Command(gotool, "env", "GOCACHE").CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not find testing GOCACHE: %v\n%s", err, out)
+			os.Exit(2)
+		}
+		testGOCACHE = strings.TrimSpace(string(out))
+
 		// As of Sept 2017, MSan is only supported on linux/amd64.
 		// https://github.com/google/sanitizers/wiki/MemorySanitizer#getting-memorysanitizer
 		canMSan = canCgo && runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
@@ -198,7 +206,7 @@ func TestMain(m *testing.M) {
 	}
 	os.Setenv("HOME", "/test-go-home-does-not-exist")
 	if os.Getenv("GOCACHE") == "" {
-		os.Setenv("GOCACHE", "off") // because $HOME is gone
+		os.Setenv("GOCACHE", testGOCACHE) // because $HOME is gone
 	}
 
 	r := m.Run()
@@ -1975,6 +1983,59 @@ func TestGoListTest(t *testing.T) {
 
 	tg.run("list", "-test", "runtime/cgo")
 	tg.grepStdout(`^runtime/cgo$`, "missing runtime/cgo")
+
+	tg.run("list", "-deps", "-f", "{{if .DepOnly}}{{.ImportPath}}{{end}}", "sort")
+	tg.grepStdout(`^reflect$`, "missing reflect")
+	tg.grepStdoutNot(`^sort`, "unexpected sort")
+}
+
+func TestGoListCgo(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.makeTempdir()
+	tg.setenv("GOCACHE", tg.tempdir)
+
+	tg.run("list", "-f", `{{join .CgoFiles "\n"}}`, "net")
+	if tg.stdout.String() == "" {
+		t.Skip("net does not use cgo")
+	}
+	if strings.Contains(tg.stdout.String(), tg.tempdir) {
+		t.Fatalf(".CgoFiles without -cgo unexpectedly mentioned cache %s", tg.tempdir)
+	}
+	tg.run("list", "-cgo", "-f", `{{join .CgoFiles "\n"}}`, "net")
+	if !strings.Contains(tg.stdout.String(), tg.tempdir) {
+		t.Fatalf(".CgoFiles with -cgo did not mention cache %s", tg.tempdir)
+	}
+	for _, file := range strings.Split(tg.stdout.String(), "\n") {
+		if file == "" {
+			continue
+		}
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("cannot find .CgoFiles result %s: %v", file, err)
+		}
+	}
+}
+
+func TestGoListExport(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.makeTempdir()
+	tg.setenv("GOCACHE", tg.tempdir)
+
+	tg.run("list", "-f", "{{.Export}}", "strings")
+	if tg.stdout.String() != "" {
+		t.Fatalf(".Export without -export unexpectedly set")
+	}
+	tg.run("list", "-export", "-f", "{{.Export}}", "strings")
+	file := strings.TrimSpace(tg.stdout.String())
+	if file == "" {
+		t.Fatalf(".Export with -export was empty")
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("cannot find .Export result %s: %v", file, err)
+	}
 }
 
 // Issue 4096. Validate the output of unsuccessful go install foo/quxx.
@@ -2925,7 +2986,7 @@ func TestCgoPkgConfig(t *testing.T) {
 	// OpenBSD's pkg-config is strict about whitespace and only
 	// supports backslash-escaped whitespace. It does not support
 	// quotes, which the normal freedesktop.org pkg-config does
-	// support. See http://man.openbsd.org/pkg-config.1
+	// support. See https://man.openbsd.org/pkg-config.1
 	tg.tempFile("foo.pc", `
 Name: foo
 Description: The foo library
@@ -3201,6 +3262,43 @@ func TestGoTestBuildsAnXtestContainingOnlyNonRunnableExamples(t *testing.T) {
 	defer tg.cleanup()
 	tg.run("test", "-v", "./testdata/norunexample")
 	tg.grepStdout("File with non-runnable example was built.", "file with non-runnable example was not built")
+}
+
+// issue 24570
+func TestGoTestCoverMultiPackage(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-cover", "./testdata/testcover/...")
+	tg.grepStdout(`\?.*testdata/testcover/pkg1.*(\d\.\d\d\ds|cached).*coverage:.*0\.0% of statements \[no test files\]`, "expected [no test files] for pkg1")
+	tg.grepStdout(`ok.*testdata/testcover/pkg2.*(\d\.\d\d\ds|cached).*coverage:.*0\.0% of statements \[no tests to run\]`, "expected [no tests to run] for pkg2")
+	tg.grepStdout(`ok.*testdata/testcover/pkg3.*(\d\.\d\d\ds|cached).*coverage:.*100\.0% of statements`, "expected 100% coverage for pkg3")
+}
+
+// issue 24570
+func TestGoTestCoverprofileMultiPackage(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.creatingTemp("testdata/cover.out")
+	tg.run("test", "-coverprofile=testdata/cover.out", "./testdata/testcover/...")
+	tg.grepStdout(`\?.*testdata/testcover/pkg1.*(\d\.\d\d\ds|cached).*coverage:.*0\.0% of statements \[no test files\]`, "expected [no test files] for pkg1")
+	tg.grepStdout(`ok.*testdata/testcover/pkg2.*(\d\.\d\d\ds|cached).*coverage:.*0\.0% of statements \[no tests to run\]`, "expected [no tests to run] for pkg2")
+	tg.grepStdout(`ok.*testdata/testcover/pkg3.*(\d\.\d\d\ds|cached).*coverage:.*100\.0% of statements`, "expected 100% coverage for pkg3")
+	if out, err := ioutil.ReadFile("testdata/cover.out"); err != nil {
+		t.Error(err)
+	} else {
+		if !bytes.Contains(out, []byte("mode: set")) {
+			t.Errorf(`missing "mode: set" in %s`, out)
+		}
+		if !bytes.Contains(out, []byte(`pkg1/a.go:5.10,7.2 1 0`)) && !bytes.Contains(out, []byte(`pkg1\a.go:5.10,7.2 1 0`)) {
+			t.Errorf(`missing "pkg1/a.go:5.10,7.2 1 0" in %s`, out)
+		}
+		if !bytes.Contains(out, []byte(`pkg2/a.go:5.10,7.2 1 0`)) && !bytes.Contains(out, []byte(`pkg2\a.go:5.10,7.2 1 0`)) {
+			t.Errorf(`missing "pkg2/a.go:5.10,7.2 1 0" in %s`, out)
+		}
+		if !bytes.Contains(out, []byte(`pkg3/a.go:5.10,7.2 1 1`)) && !bytes.Contains(out, []byte(`pkg3\a.go:5.10,7.2 1 1`)) {
+			t.Errorf(`missing "pkg3/a.go:5.10,7.2 1 1" in %s`, out)
+		}
+	}
 }
 
 func TestGoGenerateHandlesSimpleCommand(t *testing.T) {
@@ -3688,6 +3786,40 @@ func TestGoGetUpdateInsecure(t *testing.T) {
 	const pkg = repo + "/hello"
 	tg.runFail("get", "-d", "-u", "-f", pkg)
 	tg.run("get", "-d", "-u", "-f", "-insecure", pkg)
+}
+
+func TestGoGetUpdateUnknownProtocol(t *testing.T) {
+	testenv.MustHaveExternalNetwork(t)
+
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.makeTempdir()
+	tg.setenv("GOPATH", tg.path("."))
+
+	const repo = "github.com/golang/example"
+
+	// Clone the repo via HTTPS manually.
+	repoDir := tg.path("src/" + repo)
+	cmd := exec.Command("git", "clone", "-q", "https://"+repo, repoDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cloning %v repo: %v\n%s", repo, err, out)
+	}
+
+	// Configure the repo to use a protocol unknown to cmd/go
+	// that still actually works.
+	cmd = exec.Command("git", "remote", "set-url", "origin", "xyz://"+repo)
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote set-url: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "config", "--local", "url.https://github.com/.insteadOf", "xyz://github.com/")
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git config: %v\n%s", err, out)
+	}
+
+	// We need -f to ignore import comments.
+	tg.run("get", "-d", "-u", "-f", repo+"/hello")
 }
 
 func TestGoGetInsecureCustomDomain(t *testing.T) {
@@ -4892,30 +5024,34 @@ func TestTestRegexps(t *testing.T) {
 	//	BenchmarkX/Y is run in full, twice
 	want := `=== RUN   TestX
 === RUN   TestX/Y
-	x_test.go:6: LOG: X running
-    	x_test.go:8: LOG: Y running
+    x_test.go:6: LOG: X running
+        x_test.go:8: LOG: Y running
 === RUN   TestXX
-	z_test.go:10: LOG: XX running
+    z_test.go:10: LOG: XX running
 === RUN   TestX
 === RUN   TestX/Y
-	x_test.go:6: LOG: X running
-    	x_test.go:8: LOG: Y running
+    x_test.go:6: LOG: X running
+        x_test.go:8: LOG: Y running
 === RUN   TestXX
-	z_test.go:10: LOG: XX running
+    z_test.go:10: LOG: XX running
 --- BENCH: BenchmarkX/Y
-	x_test.go:15: LOG: Y running N=1
-	x_test.go:15: LOG: Y running N=100
-	x_test.go:15: LOG: Y running N=10000
-	x_test.go:15: LOG: Y running N=1000000
-	x_test.go:15: LOG: Y running N=100000000
-	x_test.go:15: LOG: Y running N=2000000000
+    x_test.go:15: LOG: Y running N=1
+    x_test.go:15: LOG: Y running N=100
+    x_test.go:15: LOG: Y running N=10000
+    x_test.go:15: LOG: Y running N=1000000
+    x_test.go:15: LOG: Y running N=100000000
+    x_test.go:15: LOG: Y running N=2000000000
 --- BENCH: BenchmarkX/Y
-	x_test.go:15: LOG: Y running N=1
-	x_test.go:15: LOG: Y running N=2000000000
+    x_test.go:15: LOG: Y running N=1
+    x_test.go:15: LOG: Y running N=100
+    x_test.go:15: LOG: Y running N=10000
+    x_test.go:15: LOG: Y running N=1000000
+    x_test.go:15: LOG: Y running N=100000000
+    x_test.go:15: LOG: Y running N=2000000000
 --- BENCH: BenchmarkX
-	x_test.go:13: LOG: X running N=1
+    x_test.go:13: LOG: X running N=1
 --- BENCH: BenchmarkXX
-	z_test.go:18: LOG: XX running N=1
+    z_test.go:18: LOG: XX running N=1
 `
 
 	have := strings.Join(lines, "")
@@ -6324,4 +6460,15 @@ func TestCDAndGOPATHAreDifferent(t *testing.T) {
 		testCDAndGOPATHAreDifferent(tg, cd, strings.ToUpper(gopath))
 		testCDAndGOPATHAreDifferent(tg, cd, strings.ToLower(gopath))
 	}
+}
+
+// Issue 25579.
+func TestGoBuildDashODevNull(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.setenv("GOPATH", filepath.Join(tg.pwd(), "testdata"))
+	tg.run("build", "-o", os.DevNull, filepath.Join(tg.pwd(), "testdata", "src", "hello", "hello.go"))
+	tg.mustNotExist("hello")
+	tg.mustNotExist("hello.exe")
 }

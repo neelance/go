@@ -88,7 +88,7 @@ func assignAddress(ctxt *ld.Link, sect *sym.Section, n int, s *sym.Symbol, va ui
 }
 
 // asmb writes the final WebAssembly module binary.
-// Spec: http://webassembly.github.io/spec/core/binary/modules.html
+// Spec: https://webassembly.github.io/spec/core/binary/modules.html
 func asmb(ctxt *ld.Link) {
 	if ctxt.Debugvlog != 0 {
 		ctxt.Logf("%5.2f asmb\n", ld.Cputime())
@@ -177,7 +177,7 @@ func asmb(ctxt *ld.Link) {
 	writeCodeSec(ctxt, fns)
 	writeDataSec(ctxt)
 	if !*ld.FlagS {
-		writeNameSec(ctxt, append(hostImports, fns...))
+		writeNameSec(ctxt, len(hostImports), fns)
 	}
 
 	ctxt.Out.Flush()
@@ -304,6 +304,7 @@ func writeGlobalSec(ctxt *ld.Link) {
 		I64, // 6: RET1
 		I64, // 7: RET2
 		I64, // 8: RET3
+		I32, // 9: RUN
 	}
 
 	writeUleb128(ctxt.Out, uint64(len(globalRegs))) // number of globals
@@ -408,14 +409,14 @@ var nameRegexp = regexp.MustCompile(`[^\w\.]`)
 // writeNameSec writes an optional section that assigns names to the functions declared by the "func" section.
 // The names are only used by WebAssembly stack traces, debuggers and decompilers.
 // TODO(neelance): add symbol table of DATA symbols
-func writeNameSec(ctxt *ld.Link, fns []*wasmFunc) {
+func writeNameSec(ctxt *ld.Link, firstFnIndex int, fns []*wasmFunc) {
 	sizeOffset := writeSecHeader(ctxt, sectionCustom)
 	writeName(ctxt.Out, "name")
 
 	sizeOffset2 := writeSecHeader(ctxt, 0x01) // function names
 	writeUleb128(ctxt.Out, uint64(len(fns)))
 	for i, fn := range fns {
-		writeUleb128(ctxt.Out, uint64(i))
+		writeUleb128(ctxt.Out, uint64(firstFnIndex+i))
 		writeName(ctxt.Out, fn.Name)
 	}
 	writeSecSize(ctxt, sizeOffset2)

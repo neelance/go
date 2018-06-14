@@ -11,8 +11,6 @@ type mOS struct {
 	waitsema uint32 // semaphore for parking on locks
 }
 
-var darwinVersion int
-
 //go:noescape
 func mach_msg_trap(h unsafe.Pointer, op int32, send_size, rcv_size, rcv_name, timeout, notify uint32) int32
 
@@ -50,33 +48,13 @@ func osinit() {
 
 	ncpu = getncpu()
 	physPageSize = getPageSize()
-	darwinVersion = getDarwinVersion()
 }
 
 const (
-	_CTL_KERN       = 1
-	_CTL_HW         = 6
-	_KERN_OSRELEASE = 2
-	_HW_NCPU        = 3
-	_HW_PAGESIZE    = 7
+	_CTL_HW      = 6
+	_HW_NCPU     = 3
+	_HW_PAGESIZE = 7
 )
-
-func getDarwinVersion() int {
-	// Use sysctl to fetch kern.osrelease
-	mib := [2]uint32{_CTL_KERN, _KERN_OSRELEASE}
-	var out [32]byte
-	nout := unsafe.Sizeof(out)
-	ret := sysctl(&mib[0], 2, (*byte)(unsafe.Pointer(&out)), &nout, nil, 0)
-	if ret >= 0 {
-		ver := 0
-		for i := 0; i < int(nout) && out[i] >= '0' && out[i] <= '9'; i++ {
-			ver *= 10
-			ver += int(out[i] - '0')
-		}
-		return ver
-	}
-	return 17 // should not happen: default to a newish version
-}
 
 func getncpu() int32 {
 	// Use sysctl to fetch hw.ncpu.
@@ -228,7 +206,6 @@ func mpreinit(mp *m) {
 func minit() {
 	// The alternate signal stack is buggy on arm and arm64.
 	// The signal handler handles it directly.
-	// The sigaltstack assembly function does nothing.
 	if GOARCH != "arm" && GOARCH != "arm64" {
 		minitSignalStack()
 	}
@@ -522,22 +499,7 @@ const (
 )
 
 //go:noescape
-func sigprocmask(how int32, new, old *sigset)
-
-//go:noescape
-func sigaction(mode uint32, new *sigactiont, old *usigactiont)
-
-//go:noescape
-func sigaltstack(new, old *stackt)
-
-// darwin/arm64 uses registers instead of stack-based arguments.
-// TODO: does this matter?
-func sigtramp(fn uintptr, infostyle, sig uint32, info *siginfo, ctx unsafe.Pointer)
-
-//go:noescape
 func setitimer(mode int32, new, old *itimerval)
-
-func raiseproc(sig uint32)
 
 //extern SigTabTT runtime·sigtab[];
 
@@ -548,13 +510,19 @@ var sigset_all = ^sigset(0)
 //go:nosplit
 //go:nowritebarrierrec
 func setsig(i uint32, fn uintptr) {
-	var sa sigactiont
+	var sa usigactiont
 	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
 	sa.sa_mask = ^uint32(0)
-	sa.sa_tramp = unsafe.Pointer(funcPC(sigtramp)) // runtime·sigtramp's job is to call into real handler
+	if fn == funcPC(sighandler) {
+		fn = funcPC(sigtramp)
+	}
 	*(*uintptr)(unsafe.Pointer(&sa.__sigaction_u)) = fn
 	sigaction(i, &sa, nil)
 }
+
+// sigtramp is the callback from libc when a signal is received.
+// It is called with the C calling convention.
+func sigtramp()
 
 //go:nosplit
 //go:nowritebarrierrec
@@ -565,9 +533,8 @@ func setsigstack(i uint32) {
 	if osa.sa_flags&_SA_ONSTACK != 0 {
 		return
 	}
-	var sa sigactiont
+	var sa usigactiont
 	*(*uintptr)(unsafe.Pointer(&sa.__sigaction_u)) = handler
-	sa.sa_tramp = unsafe.Pointer(funcPC(sigtramp))
 	sa.sa_mask = osa.sa_mask
 	sa.sa_flags = osa.sa_flags | _SA_ONSTACK
 	sigaction(i, &sa, nil)

@@ -312,7 +312,6 @@ func (t *tester) registerStdTest(pkg string) {
 					break
 				}
 			}
-
 			args := []string{
 				"test",
 				short(),
@@ -355,7 +354,8 @@ func (t *tester) registerRaceBenchTest(pkg string) {
 				"test",
 				short(),
 				"-race",
-				"-run=^$", // nothing. only benchmarks.
+				t.timeout(1200), // longer timeout for race with benchmarks
+				"-run=^$",       // nothing. only benchmarks.
 				"-benchtime=.1s",
 				"-cpu=4",
 			}
@@ -889,7 +889,7 @@ func (t *tester) extLink() bool {
 	pair := gohostos + "-" + goarch
 	switch pair {
 	case "android-arm",
-		"darwin-arm", "darwin-arm64",
+		"darwin-386", "darwin-amd64", "darwin-arm", "darwin-arm64",
 		"dragonfly-amd64",
 		"freebsd-386", "freebsd-amd64", "freebsd-arm",
 		"linux-386", "linux-amd64", "linux-arm", "linux-arm64", "linux-ppc64le", "linux-mips64", "linux-mips64le", "linux-mips", "linux-mipsle", "linux-s390x",
@@ -897,15 +897,6 @@ func (t *tester) extLink() bool {
 		"openbsd-386", "openbsd-amd64",
 		"windows-386", "windows-amd64":
 		return true
-	case "darwin-386", "darwin-amd64":
-		// linkmode=external fails on OS X 10.6 and earlier == Darwin
-		// 10.8 and earlier.
-		unameR, err := exec.Command("uname", "-r").Output()
-		if err != nil {
-			log.Fatalf("uname -r: %v", err)
-		}
-		major, _ := strconv.Atoi(string(unameR[:bytes.IndexByte(unameR, '.')]))
-		return major > 10
 	}
 	return false
 }
@@ -1327,7 +1318,7 @@ func (t *tester) raceDetectorSupported() bool {
 	case "linux", "darwin", "freebsd", "windows":
 		// The race detector doesn't work on Alpine Linux:
 		// golang.org/issue/14481
-		return t.cgoEnabled && goarch == "amd64" && gohostos == goos && !isAlpineLinux()
+		return t.cgoEnabled && (goarch == "amd64" || goarch == "ppc64le") && gohostos == goos && !isAlpineLinux()
 	}
 	return false
 }
